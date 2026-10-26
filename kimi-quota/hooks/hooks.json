@@ -24,15 +24,14 @@
         ]
       }
     ],
-    "PostToolUse": [
+    "Stop": [
       {
-        "matcher": "TodoWrite",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" hook",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" stop",
             "timeoutMs": 4000,
-            "statusMessage": "查询 Kimi 用量"
+            "statusMessage": "检查 Kimi 用量状态行"
           }
         ]
       }
