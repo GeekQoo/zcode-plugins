@@ -1,0 +1,15 @@
+{
+  "name": "zcode-plugins",
+  "plugins": [
+    {
+      "name": "kimi-quota",
+      "source": "./kimi-quota",
+      "version": "0.1.0",
+      "description": "Kimi 会话中自动展示 Kimi Code Plan 剩余额度（任务完成时附一行状态），并提供 /kimi-quota 手动查询",
+      "displayName": "Kimi 额度",
+      "displayName_i18n": { "zh-CN": "Kimi 额度" },
+      "description_i18n": { "zh-CN": "Kimi 会话中自动展示 Kimi Code Plan 剩余额度，并提供 /kimi-quota 手动查询" },
+      "category": "productivity"
+    }
+  ]
+}

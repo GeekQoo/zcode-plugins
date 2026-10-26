@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" sessionstart",
+            "timeoutMs": 3000,
+            "statusMessage": "检查会话模型"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "TodoWrite",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" hook",
+            "timeoutMs": 4000,
+            "statusMessage": "查询 Kimi 用量"
+          }
+        ]
+      }
+    ]
+  }
+}
