@@ -32,15 +32,25 @@ session_model() {
     model=$(sqlite3 "$TASKS_DB" "SELECT model FROM tasks WHERE task_id LIKE '%'||'$sid'||'%' ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
   fi
   if [ -z "$model" ]; then
-    # 会话表里查不到：记录收到的 id，便于安装后核对 hook 传入的格式
+    # 会话表里查不到：追加记录收到的 id，便于核对 hook 传入的格式
     mkdir -p "$CACHE_DIR" 2>/dev/null
-    printf '%s sid=%s\n' "$(date '+%m-%d %H:%M:%S')" "$sid" > "$CACHE_DIR/gate.log" 2>/dev/null
+    printf '%s sid=%s\n' "$(date '+%m-%d %H:%M:%S')" "$sid" >> "$CACHE_DIR/gate.log" 2>/dev/null
   fi
   printf '%s' "$model"
 }
 
-is_kimi_session() {
-  case "$(session_model "$(current_session_id)")" in
+# 每次触发留痕（模式 + 查到的模型），排查"到底触发没触发"一类问题
+hooklog() { # $1: 模式  $2: 查到的模型行
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  printf '%s mode=%s sid=%s model=%s\n' "$(date '+%m-%d %H:%M:%S')" "$1" "${CLAUDE_SESSION_ID:-}" "${2:-}" >> "$CACHE_DIR/invocations.log" 2>/dev/null
+  if [ -f "$CACHE_DIR/invocations.log" ] && [ "$(wc -l < "$CACHE_DIR/invocations.log" 2>/dev/null || echo 0)" -gt 300 ]; then
+    tail -n 200 "$CACHE_DIR/invocations.log" > "$CACHE_DIR/invocations.log.tmp" 2>/dev/null && mv "$CACHE_DIR/invocations.log.tmp" "$CACHE_DIR/invocations.log" 2>/dev/null
+  fi
+  return 0
+}
+
+is_kimi_model() { # $1: session_model 的返回值
+  case "$1" in
     moonshot-kimi/*) return 0 ;;
     *) return 1 ;;
   esac
@@ -193,11 +203,20 @@ SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。之后每�
 
 case "$MODE" in
   sessionstart)
-    is_kimi_session || exit 0
+    MODEL_ROW="$(session_model "$(current_session_id)")"
+    if [ -z "$MODEL_ROW" ]; then
+      # 会话行可能仍在写入（SessionStart 与建行存在竞态），稍候重试一次
+      sleep 1
+      MODEL_ROW="$(session_model "$(current_session_id)")"
+    fi
+    hooklog sessionstart "$MODEL_ROW"
+    is_kimi_model "$MODEL_ROW" || exit 0
     emit_context SessionStart "$SESSION_RULE"
     ;;
-  hook)
-    is_kimi_session || exit 0
+  hook|prompt)
+    MODEL_ROW="$(session_model "$(current_session_id)")"
+    hooklog "$MODE" "$MODEL_ROW"
+    is_kimi_model "$MODEL_ROW" || exit 0
     LINE=""
     LINE=$(resolve_line) || exit 0
     now=$(date +%s)
@@ -207,7 +226,8 @@ case "$MODE" in
       exit 0
     fi
     mark_injected "$LINE"
-    emit_context PostToolUse "$LINE
+    EV="PostToolUse"; [ "$MODE" = "prompt" ] && EV="UserPromptSubmit"
+    emit_context "$EV" "$LINE
 （请将上面这行 Kimi 状态原样附在当前回复的末尾）"
     ;;
   query)
