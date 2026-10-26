@@ -228,7 +228,7 @@ case "$MODE" in
     mark_injected "$LINE"
     EV="PostToolUse"; [ "$MODE" = "prompt" ] && EV="UserPromptSubmit"
     emit_context "$EV" "$LINE
-（请将上面这行 Kimi 状态原样附在当前回复的末尾）"
+（请在这次回复的最末尾另起一行，原样附上上面这行 Kimi 状态，不要解释、不要改动内容）"
     ;;
   query)
     json=$(fetch_usage_json)
