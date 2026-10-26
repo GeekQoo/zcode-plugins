@@ -6,7 +6,7 @@
 
 | 插件 | 功能 | 版本与日期 |
 | --- | --- | --- |
-| [Kimi 额度](kimi-quota/README.md) | `/kimi-quota` 手动查询额度；Kimi 会话回复末尾自动附上用量状态行 | v0.1.2 · 2026-10-26 |
+| [Kimi 额度](kimi-quota/README.md) | `/kimi-quota` 手动查询额度；Kimi 会话回复末尾自动附上用量状态行 | v0.1.6 · 2026-10-26 |
 
 ## 如何使用
 

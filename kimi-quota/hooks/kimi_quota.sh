@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kimi_quota.sh — Kimi Code Plan 剩余额度：hook 自动注入 / 手动查询
+# kimi_quota.sh — Kimi 用量与重置时间：hook 自动注入 / 手动查询
 # 依赖：jq、sqlite3、curl；时间转换使用 macOS 的 date
 set -uo pipefail
 umask 077
@@ -9,9 +9,17 @@ ZCODE_DIR="$HOME/.zcode"
 TASKS_DB="$ZCODE_DIR/v2/tasks-index.sqlite"
 PROVIDER_CONFIG="$ZCODE_DIR/v2/provider_config.json"
 CACHE_DIR="$HOME/.cache/kimi-quota"
-CACHE_FILE="$CACHE_DIR/usage.json"
 CACHE_TTL=300        # 额度数据缓存秒数
+CACHE_FORMAT_VERSION=2
+STATE_SCHEMA_VERSION=3
+CACHE_FILE=""
+QUERY_RECEIPT_FILE=""
+QUERY_RECEIPT_TTL=86400
+QUERY_RECEIPT_MAX=32
 KIMI_USAGE_URL_DEFAULT="https://api.kimi.com/coding/v1/usages"
+USAGE_URL=""
+USAGE_KEY=""
+USAGE_SCOPE=""
 HOOK_INPUT='{}'
 SESSION_ID=""
 TURN_ID=""
@@ -32,7 +40,7 @@ read_hook_input() {
     local encoded
     encoded=$(jq -nr --arg sid "$SESSION_ID" '$sid | @uri')
     # 不将会话 ID 直接当路径；异常过长的 ID 不保存本地状态。
-    [ "${#encoded}" -le 200 ] && STATE_FILE="$CACHE_DIR/sessions/$encoded.json"
+    [ "${#encoded}" -le 200 ] && STATE_FILE="$CACHE_DIR/sessions-v$STATE_SCHEMA_VERSION/$encoded.json"
   fi
   return 0
 }
@@ -92,14 +100,15 @@ update_state() {
 }
 
 resolve_model() {
-  local direct cached_turn
+  local direct cached_turn cached_source saved_turn
   direct=$(jq -r '(.model // "") | select(type == "string")' <<<"$HOOK_INPUT")
   cached_turn=$(state_value model_turn_id)
+  cached_source=$(state_value model_source)
   if [ -n "$direct" ]; then
     MODEL_ROW="$direct"; MODEL_SOURCE='input'
-  elif [ -n "$TURN_ID" ] && [ "$cached_turn" = "$TURN_ID" ]; then
+  elif [ -n "$TURN_ID" ] && [ "$cached_turn" = "$TURN_ID" ] && [ "$cached_source" = 'input' ]; then
     # 同一首轮继续使用 SessionStart 的真实模型，避免旧数据库值覆盖它。
-    MODEL_ROW=$(state_value model); MODEL_SOURCE='session'
+    MODEL_ROW=$(state_value model); MODEL_SOURCE='input'
   else
     MODEL_ROW=$(session_model "$SESSION_ID"); MODEL_SOURCE='database'
     if [ -z "$MODEL_ROW" ]; then
@@ -107,8 +116,9 @@ resolve_model() {
     fi
   fi
   if [ -n "$MODEL_ROW" ]; then
-    update_state '.model = $model | .model_turn_id = $turn' \
-      --arg model "$MODEL_ROW" --arg turn "$TURN_ID" || true
+    saved_turn=""; [ "$MODEL_SOURCE" = 'input' ] && saved_turn="$TURN_ID"
+    update_state '.model = $model | .model_source = $source | .model_turn_id = $turn' \
+      --arg model "$MODEL_ROW" --arg source "$MODEL_SOURCE" --arg turn "$saved_turn" || true
   fi
 }
 
@@ -132,55 +142,96 @@ kimi_usage_url() {
   esac
 }
 
+prepare_usage_scope() {
+  local digest
+  USAGE_KEY=$(kimi_api_key) || true
+  [ -n "$USAGE_KEY" ] || return 1
+  USAGE_URL=$(kimi_usage_url)
+  USAGE_SCOPE=""; CACHE_FILE=""; QUERY_RECEIPT_FILE=""
+  # macOS 自带 shasum；密钥只经 stdin 输入，指纹不可用时直接查询、不复用缓存。
+  digest=$(printf '%s\0%s' "$USAGE_URL" "$USAGE_KEY" | shasum -a 256 2>/dev/null) || return 0
+  digest="${digest%% *}"
+  if [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+    USAGE_SCOPE="$digest"
+    CACHE_FILE="$CACHE_DIR/usage-v$CACHE_FORMAT_VERSION/$digest.json"
+    QUERY_RECEIPT_FILE="$CACHE_DIR/query-v1/$digest.json"
+  fi
+  return 0
+}
+
 fetch_usage_json() {
-  local key
-  key=$(kimi_api_key)
-  [ -n "$key" ] || return 1
+  [ -n "$USAGE_KEY" ] || return 1
   # 密钥经 stdin 传入 curl 配置，避免出现在进程参数里
-  curl -sS --max-time 2 -K - "$(kimi_usage_url)" <<CURLCFG 2>/dev/null || true
-header = "Authorization: Bearer $key"
+  curl -sS --max-time 2 -K - "$USAGE_URL" <<CURLCFG 2>/dev/null || true
+header = "Authorization: Bearer $USAGE_KEY"
 header = "User-Agent: KimiCLI/1.6"
 CURLCFG
 }
 
-# ISO UTC 时间 -> 本地 HH:MM
-reset_local_hhmm() {
-  local iso="${1%%.*}"; iso="${iso%%Z}"
-  local epoch
-  epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$iso" "+%s" 2>/dev/null) || return 0
+# ISO 时间 -> 本地时刻；接受 Z、时区偏移与小数秒。
+reset_local_time() { # $1: ISO 时间  $2: date 格式
+  local iso="$1" format="$2" base zone epoch
+  if [[ "$iso" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$ ]]; then
+    base="${BASH_REMATCH[1]}"; zone="${BASH_REMATCH[3]}"
+  else
+    return 0
+  fi
+  [ "$zone" = 'Z' ] && zone='+0000'
+  zone="${zone/:/}"
+  epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S%z" "$base$zone" "+%s" 2>/dev/null) || return 0
   [ -n "$epoch" ] || return 0
-  date -r "$epoch" "+%H:%M" 2>/dev/null
+  date -r "$epoch" "+$format" 2>/dev/null
 }
 
-# 组装一行状态：Kimi ⚡ 5小时 36/100 · 11:29重置 · 本月1.3%
-# 校验数值字段后用 | 分隔，保留空的重置时间；used 缺失时由 limit-remaining 推算。
-# 百分比在 jq 内完成计算，响应字段不进入任何求值上下文。
+# 百分比优先：5h 取实际计数，月度取总额度池；同一池的重置时间成对使用。
+# 原始值先做类型校验，再计算百分比；缺失数据保持未知，不补成 0。
 build_line() {
-  local json="$1" fields used="" limit="" reset="" month=""
+  local json="$1" fields five="" reset="" month="" month_reset=""
   fields=$(jq -er '
     def finite_number:
       (if type == "number" then .
        elif type == "string" then tonumber
        else error("expected a number") end)
-      | if isfinite then . else error("expected a finite number") end;
-    first(.limits[]? | select(.window.duration == 300) | .detail) as $d
-    | ($d.limit | finite_number) as $limit
-    | (if ($d.used == null or $d.used == "")
-         then ($limit - ($d.remaining | finite_number))
-         else ($d.used | finite_number) end) as $used
-    | ($d.resetTime // "") as $reset
-    | if ($reset | type) != "string" then error("invalid reset time")
-      elif ($reset | test("[[:cntrl:]|]")) then error("invalid reset time")
-      else . end
-    | ((.usages.limit_month_code.used_ratio // .usages.limit_month_total.used_ratio // 0)
-        | finite_number | . * 1000 | round / 10 | finite_number) as $month
-    | [$used, $limit, $reset, $month] | join("|")
+      | if isfinite and (isnan | not) then . else error("expected a finite number") end;
+    def optional_number:
+      if . == null or . == "" then null else finite_number end;
+    def reset_time:
+      if . == null then ""
+      elif type != "string" then error("invalid reset time")
+      elif test("[[:cntrl:]|]") then error("invalid reset time")
+      else . end;
+    def percentage:
+      if . == null then "—"
+      else finite_number | . * 1000 | round / 10 | finite_number | tostring + "%" end;
+    (first(.limits[]? | select(.window.duration == 300) | .detail) // null) as $d
+    | (.usages.limit_5h // null) as $five_pool
+    | (if $d != null then
+         ($d.limit | optional_number) as $limit
+         | ($d.used | optional_number) as $direct_used
+         | ($d.remaining | optional_number) as $remaining
+         | (if $direct_used != null then $direct_used
+            elif $limit != null and $remaining != null then $limit - $remaining
+            else null end) as $used
+         | if $limit != null and $limit > 0 and $used != null then ($used / $limit) else null end
+       elif $five_pool.used_ratio != null then ($five_pool.used_ratio | finite_number)
+       else null end) as $five
+    | (if .usages.limit_month_total != null then .usages.limit_month_total
+       elif .usages.limit_month_code != null then .usages.limit_month_code
+       else null end) as $month_pool
+    | if $month_pool != null and ($month_pool | type) != "object" then error("invalid month pool") else . end
+    | (if $month_pool.used_ratio != null then ($month_pool.used_ratio | finite_number) else null end) as $month
+    | if $five == null and $month == null then error("no quota data") else . end
+    | [$five | percentage] + [(if $d != null then ($d.resetTime // $d.reset_time)
+         else ($five_pool.reset_time // $five_pool.resetTime) end | reset_time)]
+      + [$month | percentage] + [($month_pool.reset_time // $month_pool.resetTime | reset_time)]
+    | join("|")
     ' <<<"$json" 2>/dev/null) || return 1
-  IFS='|' read -r used limit reset month <<<"$fields" || return 1
-  local reset_hhmm reset_part=""
-  reset_hhmm=$(reset_local_hhmm "$reset")
-  [ -n "$reset_hhmm" ] && reset_part=" · ${reset_hhmm}重置"
-  printf 'Kimi ⚡ 5小时 %s/%s%s · 本月%s%%' "$used" "$limit" "$reset_part" "$month"
+  IFS='|' read -r five reset month month_reset <<<"$fields" || return 1
+  local five_time month_time
+  five_time=$(reset_local_time "$reset" '%H:%M')
+  month_time=$(reset_local_time "$month_reset" '%m/%d %H:%M')
+  printf '> Kimi 已用 · 5h **%s** · 月 **%s**｜重置 5h %s · 月 %s' \
+    "$five" "$month" "${five_time:-—}" "${month_time:-—}"
 }
 
 # 原始诊断信息只写入当前用户可访问的文件，已有日志也收紧权限。
@@ -196,28 +247,63 @@ write_error_log() {
 
 # ---------- 缓存 ----------
 
-read_cached() { # $1: 字段名 line / ts / last_inject_line / last_inject_ts
-  [ -f "$CACHE_FILE" ] || return 0
-  jq -r --arg k "$1" '.[$k] // empty' "$CACHE_FILE" 2>/dev/null
+read_fresh_line() {
+  [ -n "$CACHE_FILE" ] && [ -n "$USAGE_SCOPE" ] && [ -f "$CACHE_FILE" ] || return 0
+  jq -er --arg scope "$USAGE_SCOPE" --argjson format "$CACHE_FORMAT_VERSION" \
+    --argjson now "$(date +%s)" --argjson ttl "$CACHE_TTL" '
+      (.ts | if type == "number" then . elif type == "string" then (try tonumber catch null) else null end) as $ts
+      | select(.format == $format and .scope == $scope)
+      | select((.line | type) == "string" and (.line | length) > 0)
+      | select(($ts | type) == "number") | select($ts | isfinite and (isnan | not))
+      | select($ts >= 0 and $ts <= $now and ($now - $ts) < $ttl)
+      | .line' "$CACHE_FILE" 2>/dev/null || true
 }
 
 write_cache() { # $1: line
-  update_json "$CACHE_FILE" '.line = $line | .ts = $ts' \
-    --arg line "$1" --argjson ts "$(date +%s)"
+  [ -n "$CACHE_FILE" ] && [ -n "$USAGE_SCOPE" ] || return 0
+  update_json "$CACHE_FILE" '.line = $line | .ts = $ts | .format = $format | .scope = $scope' \
+    --arg line "$1" --argjson ts "$(date +%s)" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE"
 }
 
-# 取一条可用的状态行：缓存未过期用缓存，否则请求接口；都失败时用过期缓存兜底
+# 手动查询回执只核对已展示的行，不能用于注入；按账号隔离，最多保留一天内 32 条。
+remember_query_line() {
+  [ -n "$QUERY_RECEIPT_FILE" ] && [ -n "$USAGE_SCOPE" ] || return 0
+  update_json "$QUERY_RECEIPT_FILE" '
+    (if .format == 1 and .scope == $scope then [.receipts[]?] else [] end)
+    | map(select(type == "object")
+      | select((.line | type) == "string" and (.ts | type) == "number")
+      | select(.ts | isfinite and (isnan | not))
+      | select(.ts >= 0 and .ts <= $now and ($now - .ts) < $ttl))
+    | . + [{line: $line, ts: $now}] | .[-$max:]
+    | {format: 1, scope: $scope, receipts: .}' \
+    --arg scope "$USAGE_SCOPE" --arg line "$1" --argjson now "$(date +%s)" \
+    --argjson ttl "$QUERY_RECEIPT_TTL" --argjson max "$QUERY_RECEIPT_MAX"
+}
+
+query_line_already_shown() {
+  local prompt_ts
+  [ -n "$QUERY_RECEIPT_FILE" ] && [ -f "$QUERY_RECEIPT_FILE" ] || return 1
+  [ "$(state_value prompt_turn_id)" = "$TURN_ID" ] || return 1
+  prompt_ts=$(state_value prompt_ts)
+  [[ "$prompt_ts" =~ ^[0-9]{1,12}$ ]] || return 1
+  jq -e --arg scope "$USAGE_SCOPE" --arg actual "$1" --argjson since "$prompt_ts" \
+    --argjson now "$(date +%s)" --argjson ttl "$QUERY_RECEIPT_TTL" '
+      def normalize: sub("^>[[:blank:]]*"; "> ") | gsub("\\*\\*"; "");
+      select(.format == 1 and .scope == $scope)
+      | any(.receipts[]?;
+          select(type == "object")
+          | select((.line | type) == "string" and (.ts | type) == "number")
+          | select(.ts | isfinite and (isnan | not))
+          | .ts >= $since and .ts <= $now and ($now - .ts) < $ttl
+            and (.line | normalize) == ($actual | normalize))' \
+    "$QUERY_RECEIPT_FILE" >/dev/null 2>&1
+}
+
+# 仅复用同一凭据的有效缓存；接口失败时不把过期额度当作当前值。
 resolve_line() {
-  local now ts line json fresh
-  now=$(date +%s)
-  ts=$(read_cached ts)
-  line=$(read_cached line)
-  if [ -n "$line" ] && [[ "$ts" =~ ^[0-9]{1,12}$ ]]; then
-    ts=$((10#$ts))
-    if [ "$ts" -le "$now" ] && [ $((now - ts)) -lt $CACHE_TTL ]; then
-      printf '%s' "$line"; return 0
-    fi
-  fi
+  local line json fresh
+  line=$(read_fresh_line)
+  [ -n "$line" ] && { printf '%s' "$line"; return 0; }
   json=$(fetch_usage_json)
   if [ -n "$json" ]; then
     fresh=$(build_line "$json")
@@ -226,7 +312,6 @@ resolve_line() {
       printf '%s' "$fresh"; return 0
     fi
   fi
-  if [ -n "$line" ]; then printf '%s' "$line"; return 0; fi
   return 1
 }
 
@@ -237,16 +322,19 @@ emit_context() { # $1: 事件名  $2: 注入文本
     '{hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}'
 }
 
-SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。之后每当上下文中出现「Kimi ⚡ …」状态行，请把它原样作为当前回复的最后一行附上，不要添加额外解释。'
+SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。看到「Kimi 已用」状态行时，请原样放在回复最后一行，保留开头的 > 和百分比的 **，不要解释。'
 
 remember_line() {
-  update_state '.turn_id = $turn | .line = $line | .stop_requested = false' \
-    --arg turn "$TURN_ID" --arg line "$1"
+  update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
+    | .line_scope = $scope | .line_format = $format | .stop_requested = false' \
+    --arg turn "$TURN_ID" --arg line "$1" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE"
 }
 
 turn_line() {
   local saved_turn
   saved_turn=$(state_value turn_id)
+  [ "$(state_value line_format)" = "$CACHE_FORMAT_VERSION" ] || return 0
+  [ -n "$USAGE_SCOPE" ] && [ "$(state_value line_scope)" = "$USAGE_SCOPE" ] || return 0
   if [ -z "$TURN_ID" ] || [ "$saved_turn" = "$TURN_ID" ]; then
     state_value line
   fi
@@ -260,7 +348,15 @@ stop_already_requested() {
   local saved_turn requested
   saved_turn=$(state_value turn_id)
   requested=$(state_value stop_requested)
+  [ "$(state_value line_format)" = "$CACHE_FORMAT_VERSION" ] || return 1
   [ "$requested" = 'true' ] && { [ -z "$TURN_ID" ] || [ "$saved_turn" = "$TURN_ID" ]; }
+}
+
+status_line_matches() {
+  # 容忍引用符后的空格和加粗标记差异；保留引用要求以使用主题弱化色。
+  jq -en --arg expected "$1" --arg actual "$2" '
+    def normalize: sub("^>[[:blank:]]*"; "> ") | gsub("\\*\\*"; "");
+    ($expected | normalize) == ($actual | normalize)' >/dev/null 2>&1
 }
 
 # ---------- 入口 ----------
@@ -281,6 +377,11 @@ case "$MODE" in
       emit_context SessionStart "$SESSION_RULE" && hooklog initialized
       exit 0
     fi
+    if [ "$MODE" = 'prompt' ]; then
+      update_state '.prompt_turn_id = $turn | .prompt_ts = $now' \
+        --arg turn "$TURN_ID" --argjson now "$(date +%s)" || true
+    fi
+    prepare_usage_scope || { hooklog quota_unavailable; exit 0; }
     LINE=""
     if [ "$MODE" = 'stop' ]; then
       stop_already_requested && { hooklog stop_already_requested; exit 0; }
@@ -291,28 +392,40 @@ case "$MODE" in
       LAST_LINE=$(jq -r '(.last_assistant_message // .responseText // .responsePreview // "")
         | if type == "string" then split("\n") | map(sub("[[:space:]]+$"; ""))
           | map(select(length > 0)) | last // "" else "" end' <<<"$HOOK_INPUT")
-      if [ "$LAST_LINE" = "$LINE" ]; then
+      if status_line_matches "$LINE" "$LAST_LINE"; then
         hooklog stop_complete
+        exit 0
+      fi
+      # query 可能在本轮刷新了额度；已展示同账号的有效新行时，不补回旧快照。
+      FRESH_LINE=$(read_fresh_line)
+      if [ -n "$FRESH_LINE" ] && status_line_matches "$FRESH_LINE" "$LAST_LINE"; then
+        hooklog stop_complete_fresh
+        exit 0
+      fi
+      if query_line_already_shown "$LAST_LINE"; then
+        hooklog stop_complete_query
         exit 0
       fi
       jq -n --arg ctx "这次续跑只输出下面这一行额度状态，不要重写已完成的正文，也不要再次执行任务：
 $LINE
-不要解释这条检查。" \
+保留 > 引用符和 ** 加粗标记，不要解释。" \
         '{decision: "block", reason: "回复末尾缺少 Kimi 额度状态行。",
           hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}' || exit 0
-      update_state '.turn_id = $turn | .line = $line | .stop_requested = true' \
-        --arg turn "$TURN_ID" --arg line "$LINE" || true
+      update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
+        | .line_scope = $scope | .line_format = $format | .stop_requested = true' \
+        --arg turn "$TURN_ID" --arg line "$LINE" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE" || true
       hooklog stop_requested
       exit 0
     fi
     EV='UserPromptSubmit'; [ "$MODE" = 'hook' ] && EV='PostToolUse'
     if emit_context "$EV" "$LINE
-（请在这次回复的最末尾另起一行，原样附上上面这行 Kimi 状态，不要解释、不要改动内容）"; then
+（请在回复最末尾另起一行，原样保留上面的 > 引用符和 ** 加粗标记，不要解释）"; then
       remember_line "$LINE" || true
       hooklog injected
     fi
     ;;
   query)
+    prepare_usage_scope || { echo "查询失败：无法获取 Kimi API Key"; exit 0; }
     json=$(fetch_usage_json)
     if [ -z "$json" ]; then
       echo "查询失败：无法访问 Kimi 用量接口（检查网络或 Kimi API Key）"
@@ -329,7 +442,7 @@ $LINE
       exit 0
     fi
     write_cache "$line"
-    echo "Kimi Code Plan 用量（$(date '+%m-%d %H:%M')）："
+    remember_query_line "$line" || true
     echo "$line"
     ;;
   *)
