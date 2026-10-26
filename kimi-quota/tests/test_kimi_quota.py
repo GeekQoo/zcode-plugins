@@ -22,7 +22,7 @@ NORMAL = {
         'limit_month_code': {'used_ratio': .019, 'reset_time': '2026-11-23T00:00:00Z'},
     },
 }
-LINE = '> Kimi 已用 · 5h **43%** · 月 **2.1%**｜重置 5h 11:29 · 月 11/01 08:00'
+LINE = '`Kimi` 已用 · 5h 🟢 **43%** · 月 🟢 **2.1%** · 重置 5h 11:29 · 月 11/01 08:00'
 KEY = 'synthetic-regression-credential'
 DEFAULT_URL = 'https://api.kimi.com/coding/v1/usages'
 
@@ -73,13 +73,13 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         return hashlib.sha256((url + '\0' + key).encode()).hexdigest()
 
     def cache_file(self, key=None, url=DEFAULT_URL):
-        path = self.home / '.cache/kimi-quota/usage-v2' / (self.cache_scope(key, url) + '.json')
+        path = self.home / '.cache/kimi-quota/usage-v3' / (self.cache_scope(key, url) + '.json')
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     def cache_data(self, line=LINE, ts=None):
         return {'line': line, 'ts': int(time.time()) if ts is None else ts,
-                'format': 2, 'scope': self.cache_scope()}
+                'format': 3, 'scope': self.cache_scope()}
 
     def db_model(self, model, sid='session-one'):
         folder = self.home / '.zcode/v2'
@@ -256,8 +256,8 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         self.start()
         result = self.run_hook('prompt')
         text = result['hookSpecificOutput']['additionalContext']
-        self.assertIn('5h **36%**', text)
-        self.assertIn('月 **2.1%**', text)
+        self.assertIn('5h 🟢 **36%**', text)
+        self.assertIn('月 🟢 **2.1%**', text)
         self.assertIn('重置 5h —', text)
 
     def test_invalid_numbers_produce_no_hook_context(self):
@@ -283,7 +283,7 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
     def test_state_stays_private_and_contains_no_credential(self):
         self.start(sid='../session/path')
         self.run_hook('prompt', sid='../session/path')
-        sessions = self.home / '.cache/kimi-quota/sessions-v3'
+        sessions = self.home / '.cache/kimi-quota/sessions-v4'
         for path in sessions.iterdir():
             self.assertTrue(path.is_file())
             self.assertNotIn(KEY, path.read_text())
@@ -295,11 +295,11 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         response['limits'][0]['detail'].update(used='50', limit='200')
         response['usages']['limit_5h'] = {'used_ratio': 0}
         self.response.write_text(json.dumps(response))
-        self.assertIn('5h **25%**', self.run_hook('query'))
+        self.assertIn('5h 🟢 **25%**', self.run_hook('query'))
 
     def test_month_total_percentage_and_reset_stay_in_same_pool(self):
         text = self.run_hook('query')
-        self.assertIn('月 **2.1%**', text)
+        self.assertIn('月 🟢 **2.1%**', text)
         self.assertIn('月 11/01 08:00', text)
         self.assertNotIn('11/23', text)
 
@@ -308,7 +308,7 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         response['usages'].pop('limit_month_total')
         self.response.write_text(json.dumps(response))
         text = self.run_hook('query')
-        self.assertIn('月 **1.9%**', text)
+        self.assertIn('月 🟢 **1.9%**', text)
         self.assertIn('月 11/23 08:00', text)
 
     def test_missing_month_is_unknown_instead_of_zero(self):
@@ -317,6 +317,8 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         self.response.write_text(json.dumps(response))
         text = self.run_hook('query')
         self.assertIn('月 **—**', text)
+        self.assertEqual(text.count('🟢'), 1)
+        self.assertNotIn('🟢 **—**', text)
         self.assertTrue(text.rstrip().endswith('月 —'))
 
     def test_month_total_without_ratio_does_not_borrow_code_pool(self):
@@ -332,13 +334,16 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         response.pop('limits')
         response['usages']['limit_5h'] = {'used_ratio': .25, 'reset_time': '2026-10-26T03:29:00Z'}
         self.response.write_text(json.dumps(response))
-        self.assertIn('5h **25%**', self.run_hook('query'))
+        self.assertIn('5h 🟢 **25%**', self.run_hook('query'))
 
     def test_zero_limit_is_unknown_without_division_error(self):
         response = copy.deepcopy(NORMAL)
         response['limits'][0]['detail']['limit'] = 0
         self.response.write_text(json.dumps(response))
-        self.assertIn('5h **—**', self.run_hook('query'))
+        text = self.run_hook('query')
+        self.assertIn('5h **—**', text)
+        self.assertNotIn('5h 🟢', text)
+        self.assertNotIn('5h 🔴', text)
 
     def test_reset_offsets_fractional_seconds_and_missing_times(self):
         response = copy.deepcopy(NORMAL)
@@ -363,22 +368,26 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         (folder / 'usage-v2.json').write_text(json.dumps({
             'line': 'Kimi ⚡ 5小时 43/100 · 本月1.9%', 'ts': 9999999999}))
         self.start()
-        sessions = folder / 'sessions-v3/session-one.json'
+        sessions = folder / 'sessions-v4/session-one.json'
         state = json.loads(sessions.read_text())
         state.update(turn_id='turn-one', line='old footer', stop_requested=True)
         sessions.write_text(json.dumps(state))
         result = self.run_hook('stop', last_assistant_message='old footer')
         self.assertEqual(result['decision'], 'block')
         self.assertIn(LINE, result['hookSpecificOutput']['additionalContext'])
-        self.assertEqual(json.loads(self.cache_file().read_text())['format'], 2)
+        self.assertEqual(json.loads(self.cache_file().read_text())['format'], 3)
 
-    def test_stop_accepts_quote_spacing_but_requires_quote_style(self):
+    def test_stop_accepts_bold_variation_but_rejects_quote_style(self):
         self.start()
         self.run_hook('prompt')
-        alternate = LINE.replace('> ', '>').replace('**', '')
-        self.assertIsNone(self.run_hook('stop', last_assistant_message=alternate))
-        result = self.run_hook('stop', last_assistant_message=LINE[2:])
-        self.assertEqual(result['decision'], 'block')
+        self.assertIsNone(self.run_hook('stop', last_assistant_message=LINE.replace('**', '')))
+        for text in ['> ' + LINE, LINE.replace('`Kimi`', 'Kimi'),
+                     LINE.replace('🟢', '🔴', 1), LINE.replace('🟢 ', '', 1),
+                     LINE.replace(' · 重置', '｜重置')]:
+            with self.subTest(text=text):
+                self.run_hook('prompt')
+                result = self.run_hook('stop', last_assistant_message=text)
+                self.assertEqual(result['decision'], 'block')
 
     def test_manual_query_is_one_compact_markdown_line(self):
         self.assertEqual(self.run_hook('query').splitlines(), [LINE])
@@ -453,10 +462,10 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
     def test_query_receipts_are_bounded_and_private(self):
         self.start()
         self.run_hook('prompt')
-        receipt = self.home / '.cache/kimi-quota/query-v1' / (self.cache_scope() + '.json')
+        receipt = self.home / '.cache/kimi-quota/query-v2' / (self.cache_scope() + '.json')
         receipt.parent.mkdir(parents=True)
         now = int(time.time())
-        receipt.write_text(json.dumps({'format': 1, 'scope': self.cache_scope(), 'receipts':
+        receipt.write_text(json.dumps({'format': 2, 'scope': self.cache_scope(), 'receipts':
             [{'line': 'old-' + str(i), 'ts': now - 90000} for i in range(3)] +
             [{'line': 'recent-' + str(i), 'ts': now} for i in range(40)]}))
         receipt.chmod(0o600)
@@ -473,15 +482,15 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         self.run_hook('prompt')
         fresh = self.refreshed_query()
         self.refreshed_query(82)
-        receipt = self.home / '.cache/kimi-quota/query-v1' / (self.cache_scope() + '.json')
-        state_file = self.home / '.cache/kimi-quota/sessions-v3/session-one.json'
+        receipt = self.home / '.cache/kimi-quota/query-v2' / (self.cache_scope() + '.json')
+        state_file = self.home / '.cache/kimi-quota/sessions-v4/session-one.json'
         original = json.loads(state_file.read_text())
         for timestamp, prompt_ts in [(int(time.time()) - 10, int(time.time())),
                                      (int(time.time()) - 90000, 1)]:
             with self.subTest(timestamp=timestamp):
                 state = dict(original, prompt_ts=prompt_ts)
                 state_file.write_text(json.dumps(state))
-                receipt.write_text(json.dumps({'format': 1, 'scope': self.cache_scope(),
+                receipt.write_text(json.dumps({'format': 2, 'scope': self.cache_scope(),
                     'receipts': [{'line': fresh, 'ts': timestamp}]}))
                 result = self.run_hook('stop', last_assistant_message=fresh)
                 self.assertEqual(result['decision'], 'block')
@@ -492,7 +501,7 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         self.run_hook('prompt')
         fresh = self.refreshed_query()
         self.refreshed_query(82)
-        receipt = self.home / '.cache/kimi-quota/query-v1' / (self.cache_scope() + '.json')
+        receipt = self.home / '.cache/kimi-quota/query-v2' / (self.cache_scope() + '.json')
         content = json.loads(receipt.read_text())
         content['scope'] = 'wrong-account'
         receipt.write_text(json.dumps(content))
@@ -535,7 +544,7 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
                 self.response.write_text(json.dumps(response))
                 text = self.run_hook('query')
                 self.assertIn('5h **—**', text)
-                self.assertIn('月 **2.1%**', text)
+                self.assertIn('月 🟢 **2.1%**', text)
 
     def test_expired_cache_is_not_displayed_during_outage(self):
         self.start()
@@ -607,7 +616,7 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
     def test_previous_version_cannot_overwrite_scoped_turn_snapshot(self):
         self.start()
         self.run_hook('prompt')
-        old_sessions = self.home / '.cache/kimi-quota/sessions-v2'
+        old_sessions = self.home / '.cache/kimi-quota/sessions-v3'
         old_sessions.mkdir()
         (old_sessions / 'session-one.json').write_text(json.dumps({
             'model': 'other/model', 'model_turn_id': 'turn-one',
@@ -615,6 +624,81 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
             'line_format': 2, 'turn_id': 'turn-one', 'stop_requested': True}))
         self.assertIsNone(self.run_hook('stop', last_assistant_message=LINE))
         self.assertEqual(len(self.requests()), 1)
+
+    def test_red_green_thresholds_use_real_ratio_for_each_window(self):
+        cases = [(0, .8, '🟢 **0%**', '🟢 **80%**'),
+                 (.8, .8001, '🟢 **80%**', '🔴 **>80%**'),
+                 (.8001, .5, '🔴 **>80%**', '🟢 **50%**'),
+                 (.79999, .81, '🟢 **80%**', '🔴 **81%**'),
+                 (1, 1.2, '🔴 **100%**', '🔴 **120%**')]
+        for ratio_only in [False, True]:
+            for five, month, five_text, month_text in cases:
+                with self.subTest(ratio_only=ratio_only, five=five, month=month):
+                    response = copy.deepcopy(NORMAL)
+                    if ratio_only:
+                        response.pop('limits')
+                        response['usages']['limit_5h'] = {'used_ratio': five}
+                    else:
+                        response['limits'][0]['detail'].update(used=str(five * 100), limit='100')
+                    response['usages']['limit_month_total']['used_ratio'] = month
+                    self.response.write_text(json.dumps(response))
+                    text = self.run_hook('query').strip()
+                    self.assertTrue(text.startswith('`Kimi` 已用 · '))
+                    self.assertIn('5h ' + five_text, text)
+                    self.assertIn('月 ' + month_text, text)
+                    self.assertNotIn('🟡', text)
+                    self.assertNotIn('｜', text)
+                    self.assertEqual(len(text.splitlines()), 1)
+
+    def test_query_receipts_require_selected_label_color_and_no_quote(self):
+        self.start()
+        self.run_hook('prompt')
+        fresh = self.refreshed_query()
+        self.refreshed_query(82)
+        self.assertIsNone(self.run_hook('stop', last_assistant_message=fresh.replace('**', '')))
+        for text in ['> ' + fresh, fresh.replace('🟢', '🔴', 1),
+                     fresh.replace('`Kimi`', 'Kimi')]:
+            with self.subTest(text=text):
+                self.run_hook('prompt')
+                result = self.run_hook('stop', last_assistant_message=text)
+                self.assertEqual(result['decision'], 'block')
+
+    def test_previous_style_cache_state_and_receipts_are_isolated(self):
+        self.start()
+        self.run_hook('prompt')
+        folder = self.home / '.cache/kimi-quota'
+        old_line = '> Kimi 已用 · 5h **80%** · 月 **2.1%**｜重置 5h 11:29 · 月 11/01 08:00'
+        old_files = {
+            'usage-v2/' + self.cache_scope() + '.json':
+                {'format': 2, 'scope': self.cache_scope(), 'line': old_line, 'ts': int(time.time())},
+            'sessions-v3/session-one.json':
+                {'model': 'other/model', 'turn_id': 'turn-one', 'line': old_line,
+                 'line_format': 2, 'line_scope': self.cache_scope(), 'stop_requested': True},
+            'query-v1/' + self.cache_scope() + '.json':
+                {'format': 1, 'scope': self.cache_scope(),
+                 'receipts': [{'line': old_line, 'ts': int(time.time())}]},
+        }
+        for name, content in old_files.items():
+            path = folder / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(content))
+        self.assertIsNone(self.run_hook('stop', last_assistant_message=LINE))
+        result = self.run_hook('stop', last_assistant_message=old_line)
+        self.assertEqual(result['decision'], 'block')
+        self.assertIn(LINE, result['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_previous_receipt_format_is_rejected_in_new_namespace(self):
+        self.start()
+        self.run_hook('prompt')
+        fresh = self.refreshed_query()
+        self.refreshed_query(82)
+        receipt = self.home / '.cache/kimi-quota/query-v2' / (self.cache_scope() + '.json')
+        data = json.loads(receipt.read_text())
+        data['format'] = 1
+        receipt.write_text(json.dumps(data))
+        result = self.run_hook('stop', last_assistant_message=fresh)
+        self.assertEqual(result['decision'], 'block')
 
 
 if __name__ == '__main__':

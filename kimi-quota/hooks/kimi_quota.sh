@@ -10,8 +10,9 @@ TASKS_DB="$ZCODE_DIR/v2/tasks-index.sqlite"
 PROVIDER_CONFIG="$ZCODE_DIR/v2/provider_config.json"
 CACHE_DIR="$HOME/.cache/kimi-quota"
 CACHE_TTL=300        # 额度数据缓存秒数
-CACHE_FORMAT_VERSION=2
-STATE_SCHEMA_VERSION=3
+CACHE_FORMAT_VERSION=3
+STATE_SCHEMA_VERSION=4
+QUERY_RECEIPT_FORMAT_VERSION=2
 CACHE_FILE=""
 QUERY_RECEIPT_FILE=""
 QUERY_RECEIPT_TTL=86400
@@ -154,7 +155,7 @@ prepare_usage_scope() {
   if [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; then
     USAGE_SCOPE="$digest"
     CACHE_FILE="$CACHE_DIR/usage-v$CACHE_FORMAT_VERSION/$digest.json"
-    QUERY_RECEIPT_FILE="$CACHE_DIR/query-v1/$digest.json"
+    QUERY_RECEIPT_FILE="$CACHE_DIR/query-v$QUERY_RECEIPT_FORMAT_VERSION/$digest.json"
   fi
   return 0
 }
@@ -201,8 +202,12 @@ build_line() {
       elif test("[[:cntrl:]|]") then error("invalid reset time")
       else . end;
     def percentage:
-      if . == null then "—"
-      else finite_number | . * 1000 | round / 10 | finite_number | tostring + "%" end;
+      if . == null then "**—**"
+      else finite_number as $ratio
+        | ($ratio * 1000 | round / 10 | finite_number) as $display
+        | (if $ratio > 0.8 then "🔴 " else "🟢 " end)
+          + "**" + (if $ratio > 0.8 and $display == 80 then ">80" else ($display | tostring) end) + "%**"
+      end;
     (first(.limits[]? | select(.window.duration == 300) | .detail) // null) as $d
     | (.usages.limit_5h // null) as $five_pool
     | (if $d != null then
@@ -230,7 +235,7 @@ build_line() {
   local five_time month_time
   five_time=$(reset_local_time "$reset" '%H:%M')
   month_time=$(reset_local_time "$month_reset" '%m/%d %H:%M')
-  printf '> Kimi 已用 · 5h **%s** · 月 **%s**｜重置 5h %s · 月 %s' \
+  printf '`Kimi` 已用 · 5h %s · 月 %s · 重置 5h %s · 月 %s' \
     "$five" "$month" "${five_time:-—}" "${month_time:-—}"
 }
 
@@ -269,13 +274,14 @@ write_cache() { # $1: line
 remember_query_line() {
   [ -n "$QUERY_RECEIPT_FILE" ] && [ -n "$USAGE_SCOPE" ] || return 0
   update_json "$QUERY_RECEIPT_FILE" '
-    (if .format == 1 and .scope == $scope then [.receipts[]?] else [] end)
+    (if .format == $format and .scope == $scope then [.receipts[]?] else [] end)
     | map(select(type == "object")
       | select((.line | type) == "string" and (.ts | type) == "number")
       | select(.ts | isfinite and (isnan | not))
       | select(.ts >= 0 and .ts <= $now and ($now - .ts) < $ttl))
     | . + [{line: $line, ts: $now}] | .[-$max:]
-    | {format: 1, scope: $scope, receipts: .}' \
+    | {format: $format, scope: $scope, receipts: .}' \
+    --argjson format "$QUERY_RECEIPT_FORMAT_VERSION" \
     --arg scope "$USAGE_SCOPE" --arg line "$1" --argjson now "$(date +%s)" \
     --argjson ttl "$QUERY_RECEIPT_TTL" --argjson max "$QUERY_RECEIPT_MAX"
 }
@@ -287,9 +293,10 @@ query_line_already_shown() {
   prompt_ts=$(state_value prompt_ts)
   [[ "$prompt_ts" =~ ^[0-9]{1,12}$ ]] || return 1
   jq -e --arg scope "$USAGE_SCOPE" --arg actual "$1" --argjson since "$prompt_ts" \
+    --argjson format "$QUERY_RECEIPT_FORMAT_VERSION" \
     --argjson now "$(date +%s)" --argjson ttl "$QUERY_RECEIPT_TTL" '
-      def normalize: sub("^>[[:blank:]]*"; "> ") | gsub("\\*\\*"; "");
-      select(.format == 1 and .scope == $scope)
+      def normalize: gsub("\\*\\*"; "");
+      select(.format == $format and .scope == $scope)
       | any(.receipts[]?;
           select(type == "object")
           | select((.line | type) == "string" and (.ts | type) == "number")
@@ -322,7 +329,7 @@ emit_context() { # $1: 事件名  $2: 注入文本
     '{hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}'
 }
 
-SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。看到「Kimi 已用」状态行时，请原样放在回复最后一行，保留开头的 > 和百分比的 **，不要解释。'
+SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。看到以 `Kimi` 开头的额度状态行时，请与正文空一行，原样放在回复最后一行。保留小标签的反引号、红绿圆点和百分比的 **；不要添加引用、列表或分隔线，也不要解释。'
 
 remember_line() {
   update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
@@ -353,9 +360,9 @@ stop_already_requested() {
 }
 
 status_line_matches() {
-  # 容忍引用符后的空格和加粗标记差异；保留引用要求以使用主题弱化色。
+  # 容忍加粗标记差异；小标签和红绿圆点必须保留，引用样式不再接受。
   jq -en --arg expected "$1" --arg actual "$2" '
-    def normalize: sub("^>[[:blank:]]*"; "> ") | gsub("\\*\\*"; "");
+    def normalize: gsub("\\*\\*"; "");
     ($expected | normalize) == ($actual | normalize)' >/dev/null 2>&1
 }
 
@@ -408,7 +415,7 @@ case "$MODE" in
       fi
       jq -n --arg ctx "这次续跑只输出下面这一行额度状态，不要重写已完成的正文，也不要再次执行任务：
 $LINE
-保留 > 引用符和 ** 加粗标记，不要解释。" \
+保留小标签的反引号、红绿圆点和 ** 加粗标记，不要添加引用、列表或分隔线，也不要解释。" \
         '{decision: "block", reason: "回复末尾缺少 Kimi 额度状态行。",
           hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}' || exit 0
       update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
@@ -419,7 +426,7 @@ $LINE
     fi
     EV='UserPromptSubmit'; [ "$MODE" = 'hook' ] && EV='PostToolUse'
     if emit_context "$EV" "$LINE
-（请在回复最末尾另起一行，原样保留上面的 > 引用符和 ** 加粗标记，不要解释）"; then
+（请与正文空一行，放在回复最末尾，保留小标签的反引号、红绿圆点和 ** 加粗标记；不要添加引用、列表或分隔线，也不要解释）"; then
       remember_line "$LINE" || true
       hooklog injected
     fi

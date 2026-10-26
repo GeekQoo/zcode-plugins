@@ -4,7 +4,7 @@
     {
       "name": "kimi-quota",
       "source": "./kimi-quota",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "description": "显示 Kimi 5 小时/月度已用比例与重置时间，支持 /kimi-quota 手动查询",
       "displayName": "Kimi 额度",
       "displayName_i18n": {
