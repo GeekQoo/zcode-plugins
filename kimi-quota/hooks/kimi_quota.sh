@@ -9,22 +9,19 @@ ZCODE_DIR="$HOME/.zcode"
 TASKS_DB="$ZCODE_DIR/v2/tasks-index.sqlite"
 PROVIDER_CONFIG="$ZCODE_DIR/v2/provider_config.json"
 CACHE_DIR="$HOME/.cache/kimi-quota"
-CACHE_TTL=300        # 额度数据缓存秒数
-CACHE_FORMAT_VERSION=3
-STATE_SCHEMA_VERSION=4
-QUERY_RECEIPT_FORMAT_VERSION=2
-CACHE_FILE=""
-QUERY_RECEIPT_FILE=""
-QUERY_RECEIPT_TTL=86400
-QUERY_RECEIPT_MAX=32
+STATE_SCHEMA_VERSION=6
+PROGRESS_INTERVAL="${KIMI_QUOTA_PROGRESS_INTERVAL:-600}"
+PROGRESS_RETRY_INTERVAL=60
+LOCK_DIR=""
+LOCK_HELD=false
 KIMI_USAGE_URL_DEFAULT="https://api.kimi.com/coding/v1/usages"
 USAGE_URL=""
 USAGE_KEY=""
-USAGE_SCOPE=""
 HOOK_INPUT='{}'
 SESSION_ID=""
 TURN_ID=""
 STATE_FILE=""
+SESSION_FILE=""
 MODEL_ROW=""
 MODEL_SOURCE="unknown"
 
@@ -41,7 +38,14 @@ read_hook_input() {
     local encoded
     encoded=$(jq -nr --arg sid "$SESSION_ID" '$sid | @uri')
     # 不将会话 ID 直接当路径；异常过长的 ID 不保存本地状态。
-    [ "${#encoded}" -le 200 ] && STATE_FILE="$CACHE_DIR/sessions-v$STATE_SCHEMA_VERSION/$encoded.json"
+    if [ "${#encoded}" -le 200 ]; then
+      SESSION_FILE="$CACHE_DIR/sessions-v$STATE_SCHEMA_VERSION/$encoded.json"
+      if [ -n "$TURN_ID" ]; then
+        local encoded_turn
+        encoded_turn=$(jq -nr --arg turn "$TURN_ID" '$turn | @uri')
+        [ "${#encoded_turn}" -le 200 ] && STATE_FILE="$CACHE_DIR/turns-v$STATE_SCHEMA_VERSION/$encoded/$encoded_turn.json"
+      fi
+    fi
   fi
   return 0
 }
@@ -78,6 +82,11 @@ state_value() {
   jq -r --arg key "$1" '.[$key] // empty' "$STATE_FILE" 2>/dev/null || true
 }
 
+session_value() {
+  [ -n "$SESSION_FILE" ] && [ -f "$SESSION_FILE" ] || return 0
+  jq -r --arg key "$1" '.[$key] // empty' "$SESSION_FILE" 2>/dev/null || true
+}
+
 # 独立临时文件 + 原子替换；坏缓存可以重新创建，多会话写入不共用 .tmp。
 update_json() { # $1: 文件  $2: jq 过滤器  其余参数传给 jq
   local file="$1" filter="$2" tmp input='/dev/null'
@@ -100,6 +109,11 @@ update_state() {
   update_json "$STATE_FILE" "$@"
 }
 
+update_session() {
+  [ -n "$SESSION_FILE" ] || return 0
+  update_json "$SESSION_FILE" "$@"
+}
+
 resolve_model() {
   local direct cached_turn cached_source saved_turn
   direct=$(jq -r '(.model // "") | select(type == "string")' <<<"$HOOK_INPUT")
@@ -113,13 +127,14 @@ resolve_model() {
   else
     MODEL_ROW=$(session_model "$SESSION_ID"); MODEL_SOURCE='database'
     if [ -z "$MODEL_ROW" ]; then
-      MODEL_ROW=$(state_value model); MODEL_SOURCE='session'
+      MODEL_ROW=$(session_value model); MODEL_SOURCE='session'
     fi
   fi
   if [ -n "$MODEL_ROW" ]; then
     saved_turn=""; [ "$MODEL_SOURCE" = 'input' ] && saved_turn="$TURN_ID"
     update_state '.model = $model | .model_source = $source | .model_turn_id = $turn' \
       --arg model "$MODEL_ROW" --arg source "$MODEL_SOURCE" --arg turn "$saved_turn" || true
+    update_session '.model = $model' --arg model "$MODEL_ROW" || true
   fi
 }
 
@@ -143,20 +158,10 @@ kimi_usage_url() {
   esac
 }
 
-prepare_usage_scope() {
-  local digest
+prepare_usage() {
   USAGE_KEY=$(kimi_api_key) || true
   [ -n "$USAGE_KEY" ] || return 1
   USAGE_URL=$(kimi_usage_url)
-  USAGE_SCOPE=""; CACHE_FILE=""; QUERY_RECEIPT_FILE=""
-  # macOS 自带 shasum；密钥只经 stdin 输入，指纹不可用时直接查询、不复用缓存。
-  digest=$(printf '%s\0%s' "$USAGE_URL" "$USAGE_KEY" | shasum -a 256 2>/dev/null) || return 0
-  digest="${digest%% *}"
-  if [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; then
-    USAGE_SCOPE="$digest"
-    CACHE_FILE="$CACHE_DIR/usage-v$CACHE_FORMAT_VERSION/$digest.json"
-    QUERY_RECEIPT_FILE="$CACHE_DIR/query-v$QUERY_RECEIPT_FORMAT_VERSION/$digest.json"
-  fi
   return 0
 }
 
@@ -250,197 +255,236 @@ write_error_log() {
   ) 2>/dev/null
 }
 
-# ---------- 缓存 ----------
+# ---------- 会话状态与并发 ----------
 
-read_fresh_line() {
-  [ -n "$CACHE_FILE" ] && [ -n "$USAGE_SCOPE" ] && [ -f "$CACHE_FILE" ] || return 0
-  jq -er --arg scope "$USAGE_SCOPE" --argjson format "$CACHE_FORMAT_VERSION" \
-    --argjson now "$(date +%s)" --argjson ttl "$CACHE_TTL" '
-      (.ts | if type == "number" then . elif type == "string" then (try tonumber catch null) else null end) as $ts
-      | select(.format == $format and .scope == $scope)
-      | select((.line | type) == "string" and (.line | length) > 0)
-      | select(($ts | type) == "number") | select($ts | isfinite and (isnan | not))
-      | select($ts >= 0 and $ts <= $now and ($now - $ts) < $ttl)
-      | .line' "$CACHE_FILE" 2>/dev/null || true
+if [[ "$PROGRESS_INTERVAL" =~ ^[0-9]{1,5}$ ]] \
+    && [ "$((10#$PROGRESS_INTERVAL))" -ge 60 ] && [ "$((10#$PROGRESS_INTERVAL))" -le 86400 ]; then
+  PROGRESS_INTERVAL=$((10#$PROGRESS_INTERVAL))
+else
+  PROGRESS_INTERVAL=600
+fi
+
+state_epoch() {
+  local value
+  value=$(state_value "$1")
+  [[ "$value" =~ ^[0-9]{1,12}$ ]] || return 1
+  printf '%s' "$((10#$value))"
 }
 
-write_cache() { # $1: line
-  [ -n "$CACHE_FILE" ] && [ -n "$USAGE_SCOPE" ] || return 0
-  update_json "$CACHE_FILE" '.line = $line | .ts = $ts | .format = $format | .scope = $scope' \
-    --arg line "$1" --argjson ts "$(date +%s)" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE"
+release_session_lock() {
+  local owner=""
+  [ "$LOCK_HELD" = true ] && [ -n "$LOCK_DIR" ] || return 0
+  IFS= read -r owner 2>/dev/null < "$LOCK_DIR/pid" || true
+  if [ "$owner" = "$$" ]; then
+    rm -f "$LOCK_DIR/pid" 2>/dev/null
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  LOCK_HELD=false
 }
 
-# 手动查询回执只核对已展示的行，不能用于注入；按账号隔离，最多保留一天内 32 条。
-remember_query_line() {
-  [ -n "$QUERY_RECEIPT_FILE" ] && [ -n "$USAGE_SCOPE" ] || return 0
-  update_json "$QUERY_RECEIPT_FILE" '
-    (if .format == $format and .scope == $scope then [.receipts[]?] else [] end)
-    | map(select(type == "object")
-      | select((.line | type) == "string" and (.ts | type) == "number")
-      | select(.ts | isfinite and (isnan | not))
-      | select(.ts >= 0 and .ts <= $now and ($now - .ts) < $ttl))
-    | . + [{line: $line, ts: $now}] | .[-$max:]
-    | {format: $format, scope: $scope, receipts: .}' \
-    --argjson format "$QUERY_RECEIPT_FORMAT_VERSION" \
-    --arg scope "$USAGE_SCOPE" --arg line "$1" --argjson now "$(date +%s)" \
-    --argjson ttl "$QUERY_RECEIPT_TTL" --argjson max "$QUERY_RECEIPT_MAX"
-}
-
-query_line_already_shown() {
-  local prompt_ts
-  [ -n "$QUERY_RECEIPT_FILE" ] && [ -f "$QUERY_RECEIPT_FILE" ] || return 1
-  [ "$(state_value prompt_turn_id)" = "$TURN_ID" ] || return 1
-  prompt_ts=$(state_value prompt_ts)
-  [[ "$prompt_ts" =~ ^[0-9]{1,12}$ ]] || return 1
-  jq -e --arg scope "$USAGE_SCOPE" --arg actual "$1" --argjson since "$prompt_ts" \
-    --argjson format "$QUERY_RECEIPT_FORMAT_VERSION" \
-    --argjson now "$(date +%s)" --argjson ttl "$QUERY_RECEIPT_TTL" '
-      def normalize: gsub("\\*\\*"; "");
-      select(.format == $format and .scope == $scope)
-      | any(.receipts[]?;
-          select(type == "object")
-          | select((.line | type) == "string" and (.ts | type) == "number")
-          | select(.ts | isfinite and (isnan | not))
-          | .ts >= $since and .ts <= $now and ($now - .ts) < $ttl
-            and (.line | normalize) == ($actual | normalize))' \
-    "$QUERY_RECEIPT_FILE" >/dev/null 2>&1
-}
-
-# 仅复用同一凭据的有效缓存；接口失败时不把过期额度当作当前值。
-resolve_line() {
-  local line json fresh
-  line=$(read_fresh_line)
-  [ -n "$line" ] && { printf '%s' "$line"; return 0; }
-  json=$(fetch_usage_json)
-  if [ -n "$json" ]; then
-    fresh=$(build_line "$json")
-    if [ -n "$fresh" ]; then
-      write_cache "$fresh"
-      printf '%s' "$fresh"; return 0
+recover_session_lock() {
+  local reap="$LOCK_DIR.reap" owner="" changed now
+  now=$(date +%s)
+  # 回收动作也串行，避免两个进程同时删除刚被重新获取的锁。
+  if [ -d "$reap" ]; then
+    changed=$(stat -f '%m' "$reap" 2>/dev/null) || return 0
+    if [[ "$changed" =~ ^[0-9]{1,12}$ ]] && [ $((now - changed)) -ge 10 ]; then
+      rmdir "$reap" 2>/dev/null || true
     fi
   fi
+  mkdir "$reap" 2>/dev/null || return 0
+  IFS= read -r owner 2>/dev/null < "$LOCK_DIR/pid" || true
+  if [[ "$owner" =~ ^[0-9]{1,12}$ ]] && [ "$((10#$owner))" -gt 0 ]; then
+    if ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$LOCK_DIR/pid" 2>/dev/null
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+  else
+    # mkdir 后、写 PID 前被终止的空锁，留出创建窗口后再回收。
+    changed=$(stat -f '%m' "$LOCK_DIR" 2>/dev/null) || changed="$now"
+    if [[ "$changed" =~ ^[0-9]{1,12}$ ]] && [ $((now - changed)) -ge 10 ]; then
+      rm -f "$LOCK_DIR/pid" 2>/dev/null
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+  fi
+  rmdir "$reap" 2>/dev/null || true
+}
+
+acquire_session_lock() {
+  local attempt=0 limit=60
+  [ -n "$SESSION_FILE" ] || return 0
+  LOCK_DIR="$SESSION_FILE.lock"
+  mkdir -p "${SESSION_FILE%/*}" 2>/dev/null || return 1
+  case "$MODE" in progress|hook) limit=1 ;; esac
+  while [ "$attempt" -lt "$limit" ]; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid" || { rmdir "$LOCK_DIR" 2>/dev/null; return 1; }
+      LOCK_HELD=true
+      trap release_session_lock EXIT
+      trap 'exit 0' HUP INT TERM
+      return 0
+    fi
+    recover_session_lock
+    # 回收后可立即重试一次；普通进度事件不等待其他正在执行的 Hook。
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid" || { rmdir "$LOCK_DIR" 2>/dev/null; return 1; }
+      LOCK_HELD=true
+      trap release_session_lock EXIT
+      trap 'exit 0' HUP INT TERM
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt "$limit" ] && sleep 0.05
+  done
   return 1
+}
+
+begin_turn() {
+  local saved started anchor
+  saved=$(state_value turn_id)
+  started=$(state_epoch started_at) || started=""
+  if [ -z "$TURN_ID" ] || [ "$saved" != "$TURN_ID" ] || [ -z "$started" ]; then
+    anchor=$(session_value prompt_turn_id)
+    if [ -z "$anchor" ] && [ -n "$TURN_ID" ]; then
+      anchor="$TURN_ID"
+      update_session '.prompt_turn_id = $turn' --arg turn "$anchor" || return 1
+    fi
+    update_state '.turn_id = $turn | .anchor_turn = $anchor | .started_at = $now
+      | .last_progress_at = $now | .last_progress_attempt_at = $now
+      | .stop_checked = false | .stop_requested = false' \
+      --arg turn "$TURN_ID" --arg anchor "$anchor" --argjson now "$(date +%s)" || return 1
+  fi
+}
+
+turn_is_obsolete() {
+  local anchor current
+  anchor=$(state_value anchor_turn)
+  current=$(session_value prompt_turn_id)
+  [ -n "$anchor" ] && [ -n "$current" ] && [ "$anchor" != "$current" ]
+}
+
+stop_was_checked() {
+  [ -n "$TURN_ID" ] && [ "$(state_value turn_id)" = "$TURN_ID" ] \
+    && [ "$(state_value stop_checked)" = true ]
+}
+
+# 每次播报和最终检查都直接查询；不读取旧版的额度缓存或本轮快照。
+refresh_line() {
+  local json
+  prepare_usage || return 1
+  json=$(fetch_usage_json)
+  [ -n "$json" ] || return 1
+  build_line "$json"
 }
 
 # ---------- hook 输出 ----------
 
-emit_context() { # $1: 事件名  $2: 注入文本
+emit_context() {
   jq -n --arg ev "$1" --arg ctx "$2" \
     '{hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}'
 }
 
-SESSION_RULE='[Kimi额度监控] 本会话正在使用 Kimi 模型。看到以 `Kimi` 开头的额度状态行时，请与正文空一行，原样放在回复最后一行。保留小标签的反引号、红绿圆点和百分比的 **；不要添加引用、列表或分隔线，也不要解释。'
+SESSION_RULE='[Kimi额度监控] 不要自行生成或复用历史额度状态行。收到中途额度播报时，立即单独展示提供的状态行，然后继续当前任务，不要结束或重做任务。任务结束时由 Hook 查询最终额度；收到最终额度后只补充提供的状态行。所有额度行与正文空一行，保留小标签的反引号、红绿圆点和百分比加粗，不添加引用、列表或分隔线。'
 
-remember_line() {
-  update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
-    | .line_scope = $scope | .line_format = $format | .stop_requested = false' \
-    --arg turn "$TURN_ID" --arg line "$1" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE"
-}
-
-turn_line() {
-  local saved_turn
-  saved_turn=$(state_value turn_id)
-  [ "$(state_value line_format)" = "$CACHE_FORMAT_VERSION" ] || return 0
-  [ -n "$USAGE_SCOPE" ] && [ "$(state_value line_scope)" = "$USAGE_SCOPE" ] || return 0
-  if [ -z "$TURN_ID" ] || [ "$saved_turn" = "$TURN_ID" ]; then
-    state_value line
-  fi
+status_line_matches() {
+  jq -en --arg expected "$1" --arg actual "$2" '
+    def normalize: gsub("\\*\\*"; "");
+    ($expected | normalize) == ($actual | normalize)' >/dev/null 2>&1
 }
 
 stop_is_active() {
   jq -e '.stop_hook_active == true or .stopHookActive == true' <<<"$HOOK_INPUT" >/dev/null 2>&1
 }
 
-stop_already_requested() {
-  local saved_turn requested
-  saved_turn=$(state_value turn_id)
-  requested=$(state_value stop_requested)
-  [ "$(state_value line_format)" = "$CACHE_FORMAT_VERSION" ] || return 1
-  [ "$requested" = 'true' ] && { [ -z "$TURN_ID" ] || [ "$saved_turn" = "$TURN_ID" ]; }
+run_progress() {
+  local now started last attempted line event
+  [ -n "$STATE_FILE" ] && [ -n "$TURN_ID" ] || { hooklog progress_missing_ids; return 0; }
+  [ "$(state_value turn_id)" = "$TURN_ID" ] || { hooklog skipped_turn; return 0; }
+  stop_was_checked && { hooklog progress_after_stop; return 0; }
+  started=$(state_epoch started_at) || { hooklog progress_missing_start; return 0; }
+  last=$(state_epoch last_progress_at) || last="$started"
+  attempted=$(state_epoch last_progress_attempt_at) || attempted="$started"
+  now=$(date +%s)
+  if [ "$started" -gt "$now" ] || [ "$last" -gt "$now" ] || [ "$attempted" -gt "$now" ]; then
+    update_state '.started_at = $now | .last_progress_at = $now | .last_progress_attempt_at = $now' \
+      --argjson now "$now" || true
+    hooklog progress_clock_reset; return 0
+  fi
+  if [ $((now - last)) -lt "$PROGRESS_INTERVAL" ] || [ $((now - attempted)) -lt "$PROGRESS_RETRY_INTERVAL" ]; then
+    hooklog progress_not_due; return 0
+  fi
+  event=$(jq -r '.hook_event_name // .hookEventName // "PostToolUse"' <<<"$HOOK_INPUT")
+  case "$event" in PostToolUse|PostToolUseFailure) ;; *) hooklog progress_wrong_event; return 0 ;; esac
+  update_state '.last_progress_attempt_at = $now' --argjson now "$now" || return 0
+  line=$(refresh_line) || { hooklog progress_unavailable; return 0; }
+  if emit_context "$event" "[Kimi中途额度播报] 请现在单独展示下面这一行，然后继续执行当前任务。不要结束本轮，不要从头重做任务，也不要重复本段播报：
+$line
+与正文空一行，保留小标签、红绿圆点和加粗格式，不添加引用、列表或分隔线。"; then
+    update_state '.last_progress_at = $now' --argjson now "$(date +%s)" || true
+    hooklog progress_injected
+  fi
 }
 
-status_line_matches() {
-  # 容忍加粗标记差异；小标签和红绿圆点必须保留，引用样式不再接受。
-  jq -en --arg expected "$1" --arg actual "$2" '
-    def normalize: gsub("\\*\\*"; "");
-    ($expected | normalize) == ($actual | normalize)' >/dev/null 2>&1
+run_stop() {
+  local line last requested=false
+  stop_was_checked && { hooklog stop_already_checked; return 0; }
+  line=$(refresh_line) || line=""
+  # 查询成功、匹配已有行或失败都记为本轮已检查，避免结束续跑反复请求。
+  update_state '.stop_checked = true | .stop_requested = false | .final_checked_at = $now' \
+    --argjson now "$(date +%s)" || true
+  [ -n "$line" ] || { hooklog quota_unavailable; return 0; }
+  last=$(jq -r '(.last_assistant_message // .responseText // .responsePreview // "")
+    | if type == "string" then split("\n") | map(sub("[[:space:]]+$"; ""))
+      | map(select(length > 0)) | last // "" else "" end' <<<"$HOOK_INPUT")
+  if status_line_matches "$line" "$last"; then
+    hooklog stop_complete; return 0
+  fi
+  jq -n --arg ctx "[Kimi最终额度] 这次续跑只输出下面这一行最新额度状态。不要重写已完成的正文，也不要再次执行任务；之前出现的额度仅是中途或历史快照，不作为本次最终值：
+$line
+保留小标签的反引号、红绿圆点和加粗标记，不添加引用、列表或分隔线，也不要解释。" \
+    '{decision: "block", reason: "请补充本次结束时查询到的 Kimi 额度。",
+      hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}' || return 0
+  update_state '.stop_requested = true' || true
+  hooklog stop_requested
 }
 
 # ---------- 入口 ----------
 
 case "$MODE" in
-  sessionstart|prompt|hook|stop)
+  sessionstart|prompt|progress|hook|stop)
     read_hook_input
-    if [ "$MODE" = 'stop' ] && stop_is_active; then
-      hooklog stop_active
-      exit 0
+    if [ "$MODE" = stop ] && stop_is_active; then
+      hooklog stop_active; exit 0
     fi
+    acquire_session_lock || { hooklog lock_busy; exit 0; }
+    case "$MODE" in
+      progress|hook)
+        [ -n "$TURN_ID" ] && [ -n "$STATE_FILE" ] || { hooklog progress_missing_ids; exit 0; }
+        turn_is_obsolete && { hooklog skipped_turn; exit 0; }
+        stop_was_checked && { hooklog progress_after_stop; exit 0; } ;;
+      stop)
+        turn_is_obsolete && { hooklog skipped_turn; exit 0; } ;;
+      sessionstart|prompt)
+        [ -z "$TURN_ID" ] || update_session '.prompt_turn_id = $turn' --arg turn "$TURN_ID" || exit 0 ;;
+    esac
     resolve_model
-    if ! is_kimi_model "$MODEL_ROW"; then
-      hooklog skipped_model
-      exit 0
-    fi
-    if [ "$MODE" = 'sessionstart' ]; then
-      emit_context SessionStart "$SESSION_RULE" && hooklog initialized
-      exit 0
-    fi
-    if [ "$MODE" = 'prompt' ]; then
-      update_state '.prompt_turn_id = $turn | .prompt_ts = $now' \
-        --arg turn "$TURN_ID" --argjson now "$(date +%s)" || true
-    fi
-    prepare_usage_scope || { hooklog quota_unavailable; exit 0; }
-    LINE=""
-    if [ "$MODE" = 'stop' ]; then
-      stop_already_requested && { hooklog stop_already_requested; exit 0; }
-      LINE=$(turn_line)
-    fi
-    [ -n "$LINE" ] || LINE=$(resolve_line) || { hooklog quota_unavailable; exit 0; }
-    if [ "$MODE" = 'stop' ]; then
-      LAST_LINE=$(jq -r '(.last_assistant_message // .responseText // .responsePreview // "")
-        | if type == "string" then split("\n") | map(sub("[[:space:]]+$"; ""))
-          | map(select(length > 0)) | last // "" else "" end' <<<"$HOOK_INPUT")
-      if status_line_matches "$LINE" "$LAST_LINE"; then
-        hooklog stop_complete
-        exit 0
-      fi
-      # query 可能在本轮刷新了额度；已展示同账号的有效新行时，不补回旧快照。
-      FRESH_LINE=$(read_fresh_line)
-      if [ -n "$FRESH_LINE" ] && status_line_matches "$FRESH_LINE" "$LAST_LINE"; then
-        hooklog stop_complete_fresh
-        exit 0
-      fi
-      if query_line_already_shown "$LAST_LINE"; then
-        hooklog stop_complete_query
-        exit 0
-      fi
-      jq -n --arg ctx "这次续跑只输出下面这一行额度状态，不要重写已完成的正文，也不要再次执行任务：
-$LINE
-保留小标签的反引号、红绿圆点和 ** 加粗标记，不要添加引用、列表或分隔线，也不要解释。" \
-        '{decision: "block", reason: "回复末尾缺少 Kimi 额度状态行。",
-          hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}' || exit 0
-      update_state '.turn_id = $turn | .line = (if $scope == "" then "" else $line end)
-        | .line_scope = $scope | .line_format = $format | .stop_requested = true' \
-        --arg turn "$TURN_ID" --arg line "$LINE" --argjson format "$CACHE_FORMAT_VERSION" --arg scope "$USAGE_SCOPE" || true
-      hooklog stop_requested
-      exit 0
-    fi
-    EV='UserPromptSubmit'; [ "$MODE" = 'hook' ] && EV='PostToolUse'
-    if emit_context "$EV" "$LINE
-（请与正文空一行，放在回复最末尾，保留小标签的反引号、红绿圆点和 ** 加粗标记；不要添加引用、列表或分隔线，也不要解释）"; then
-      remember_line "$LINE" || true
-      hooklog injected
-    fi
+    begin_turn || exit 0
+    if ! is_kimi_model "$MODEL_ROW"; then hooklog skipped_model; exit 0; fi
+    case "$MODE" in
+      sessionstart) emit_context SessionStart "$SESSION_RULE" && hooklog initialized ;;
+      prompt) emit_context UserPromptSubmit "$SESSION_RULE" && hooklog initialized_turn ;;
+      progress|hook) run_progress ;;
+      stop) begin_turn && run_stop ;;
+    esac
     ;;
   query)
-    prepare_usage_scope || { echo "查询失败：无法获取 Kimi API Key"; exit 0; }
+    prepare_usage || { echo "查询失败：无法获取 Kimi API Key"; exit 0; }
     json=$(fetch_usage_json)
     if [ -z "$json" ]; then
-      echo "查询失败：无法访问 Kimi 用量接口（检查网络或 Kimi API Key）"
-      exit 0
+      echo "查询失败：无法访问 Kimi 用量接口（检查网络或 Kimi API Key）"; exit 0
     fi
     line=$(build_line "$json")
     if [ -z "$line" ]; then
-      # 原始响应可能含账号标识，只落本地日志，不进对话
       if write_error_log "$json"; then
         echo "查询成功但未能解析额度字段，原始响应已写入 ~/.cache/kimi-quota/last-error.log"
       else
@@ -448,11 +492,7 @@ $LINE
       fi
       exit 0
     fi
-    write_cache "$line"
-    remember_query_line "$line" || true
     echo "$line"
     ;;
-  *)
-    echo "用法: kimi_quota.sh [sessionstart|prompt|stop|query]"
-    ;;
+  *) echo "用法: kimi_quota.sh [sessionstart|prompt|progress|stop|query]" ;;
 esac

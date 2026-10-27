@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" sessionstart",
-            "timeoutMs": 3000,
+            "timeoutMs": 5000,
             "statusMessage": "检查会话模型"
           }
         ]
@@ -18,8 +18,32 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" prompt",
+            "timeoutMs": 5000,
+            "statusMessage": "初始化额度播报"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" progress",
             "timeoutMs": 4000,
-            "statusMessage": "查询 Kimi 用量"
+            "statusMessage": "检查额度播报间隔"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" progress",
+            "timeoutMs": 4000,
+            "statusMessage": "检查额度播报间隔"
           }
         ]
       }
@@ -30,8 +54,8 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/kimi_quota.sh\" stop",
-            "timeoutMs": 4000,
-            "statusMessage": "检查 Kimi 用量状态行"
+            "timeoutMs": 7000,
+            "statusMessage": "刷新最终 Kimi 额度"
           }
         ]
       }
