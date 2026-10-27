@@ -384,7 +384,7 @@ emit_context() {
     '{hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}'
 }
 
-SESSION_RULE='[Kimi额度监控] 不要自行生成或复用历史额度状态行。收到中途额度播报时，立即单独展示提供的状态行，然后继续当前任务，不要结束或重做任务。任务结束时由 Hook 查询最终额度；收到最终额度后只补充提供的状态行。所有额度行与正文空一行，保留小标签的反引号、红绿圆点和百分比加粗，不添加引用、列表或分隔线。'
+SESSION_RULE='[Kimi额度监控] 不要自行生成或复用历史额度状态行。收到中途额度播报时，立即单独展示提供的状态行，然后继续当前任务，不要结束或重做任务。任务结束时由 Hook 查询最终额度；收到最终额度后，最终回复必须包含本轮完整正文和最新额度，不能只回复额度。完整保留已完成答案的内容和格式，仅替换末尾旧额度或追加新额度，不重新执行任务。所有额度行与正文空一行，保留小标签的反引号、红绿圆点和百分比加粗，不给额度行添加引用、列表或分隔线。'
 
 status_line_matches() {
   jq -en --arg expected "$1" --arg actual "$2" '
@@ -426,7 +426,7 @@ $line
 }
 
 run_stop() {
-  local line last requested=false
+  local line last
   stop_was_checked && { hooklog stop_already_checked; return 0; }
   line=$(refresh_line) || line=""
   # 查询成功、匹配已有行或失败都记为本轮已检查，避免结束续跑反复请求。
@@ -439,10 +439,15 @@ run_stop() {
   if status_line_matches "$line" "$last"; then
     hooklog stop_complete; return 0
   fi
-  jq -n --arg ctx "[Kimi最终额度] 这次续跑只输出下面这一行最新额度状态。不要重写已完成的正文，也不要再次执行任务；之前出现的额度仅是中途或历史快照，不作为本次最终值：
+  # ZCode 将 Stop 续跑后的最后一条 assistant 消息作为最终回复，先前消息
+  # 会收进工作过程。不能只输出额度，否则已完成正文在默认视图中消失。
+  # 直接引用对话中的完整答案，避免把长正文复制进有长度上限的 Hook 上下文。
+  jq -n --arg ctx "[Kimi最终额度] 这次续跑的最后一条回复会成为界面默认展示的最终答案，之前的回复可能被折叠。因此必须在同一条最终回复中先完整复现本轮已经完成的答案正文，再空一行附上下面的最新额度状态，不能只回复额度。
+从对话历史中保留本轮完整答案，逐字保留正文、代码块、列表、链接及原有格式，不概括、不删减，不用‘见上文’代替正文。若上一条仅有额度，向前找到本轮已完成的答案正文，不要把额度行当作完整答案。只替换答案末尾已有的旧额度状态行，正文中讨论额度的内容及代码示例保持原样。
+任务已经完成，不要再次调用工具、修改文件或重新执行任务，也不要添加解释本次续跑的文字。最新额度状态行如下：
 $line
-保留小标签的反引号、红绿圆点和加粗标记，不添加引用、列表或分隔线，也不要解释。" \
-    '{decision: "block", reason: "请补充本次结束时查询到的 Kimi 额度。",
+仅对额度行：保留小标签的反引号、红绿圆点和加粗标记，不添加引用、列表或分隔线。" \
+    '{decision: "block", reason: "请在同一条最终回复中完整保留已完成的答案正文，并在末尾附上最新 Kimi 额度；不能只回复额度，不要重新执行任务。",
       hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}' || return 0
   update_state '.stop_requested = true' || true
   hooklog stop_requested

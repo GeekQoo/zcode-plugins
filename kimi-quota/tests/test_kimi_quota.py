@@ -444,15 +444,55 @@ sys.stdout.write(Path(os.environ['TEST_RESPONSE']).read_text())
         self.assertIsNone(self.run_hook('progress'))
         self.assertEqual(len(self.requests()), 1)
 
-    def test_final_requests_only_one_supplement_without_repeating_task(self):
+    def test_final_requests_complete_answer_once_without_repeating_task(self):
         self.begin()
-        result = self.run_hook('stop', last_assistant_message='done')
+        result = self.run_hook('stop', last_assistant_message='你好，有什么需要我帮你处理的吗？')
         self.assertEqual(result['decision'], 'block')
         text = result['hookSpecificOutput']['additionalContext']
-        self.assertIn('只输出下面这一行', text)
-        self.assertIn('不要重写', text)
+        self.assertIn('先完整复现本轮已经完成的答案正文', text)
+        self.assertIn('不能只回复额度', text)
+        self.assertIn('完整保留已完成的答案正文', result['reason'])
+        self.assertIn('不要再次调用工具、修改文件或重新执行任务', text)
+        self.assertIn(LINE, text)
         self.assertIsNone(self.run_hook('stop', last_assistant_message='done'))
         self.assertIsNone(self.run_hook('stop', last_assistant_message=LINE, stop_hook_active=True))
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_initial_rules_require_body_and_quota_in_one_final_answer(self):
+        for result in [self.start(), self.run_hook('prompt')]:
+            text = result['hookSpecificOutput']['additionalContext']
+            self.assertIn('完整正文和最新额度', text)
+            self.assertIn('不能只回复额度', text)
+            self.assertNotIn('只补充提供的状态行', text)
+        self.assertEqual(self.requests(), [])
+
+    def test_final_preserves_rich_answer_without_copying_it_into_bounded_context(self):
+        # ZCode caps lifecycle Hook context at 24,000 characters. Refer to the
+        # existing answer in history so code/links and long answers aren't cut off.
+        body = '# 结果\n\n[文件](https://example.com/result)\n\n```python\nprint("done")\n```\n\n'
+        body += '- 已验证结果。\n' * 4000
+        self.assertGreater(len(body), 24000)
+        for index, field in enumerate(['last_assistant_message', 'responseText', 'responsePreview']):
+            turn = 'full-answer-' + str(index)
+            self.begin(turn=turn)
+            result = self.run_hook('stop', turn=turn, **{field: body})
+            text = result['hookSpecificOutput']['additionalContext']
+            self.assertLess(len(text), 4000)
+            self.assertIn('从对话历史中保留本轮完整答案', text)
+            self.assertIn('正文、代码块、列表、链接及原有格式', text)
+            self.assertIn('只替换答案末尾已有的旧额度状态行', text)
+            self.assertNotIn('只输出下面这一行', text)
+            self.assertIn(LINE, text)
+
+    def test_quota_only_previous_response_requires_recovering_body_from_history(self):
+        self.begin()
+        old_line = LINE.replace('43%', '8%')
+        result = self.run_hook('stop', last_assistant_message=old_line)
+        text = result['hookSpecificOutput']['additionalContext']
+        self.assertIn('若上一条仅有额度，向前找到本轮已完成的答案正文', text)
+        self.assertIn(LINE, text)
+        self.assertNotIn(old_line, text)
+        self.assertIsNone(self.run_hook('stop', stop_hook_active=True))
         self.assertEqual(len(self.requests()), 1)
 
     def test_active_aliases_skip_without_any_request(self):
