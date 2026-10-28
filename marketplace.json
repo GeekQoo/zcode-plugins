@@ -4,14 +4,28 @@
     {
       "name": "kimi-quota",
       "source": "./kimi-quota",
-      "version": "0.1.9",
-      "description": "播报 Kimi 5 小时/月度用量与重置时间，结束时刷新，支持 /kimi-quota 手动查询",
-      "displayName": "Kimi 额度",
+      "version": "0.1.10",
+      "description": "查询 Kimi 5 小时/月度已用额度和重置时间，支持长任务自动播报、结束刷新及 /kimi-quota 手动查询",
+      "displayName": "Kimi 额度查询",
       "displayName_i18n": {
-        "zh-CN": "Kimi 额度"
+        "zh-CN": "Kimi 额度查询"
       },
       "description_i18n": {
-        "zh-CN": "播报 Kimi 5 小时/月度用量与重置时间，结束时刷新，支持 /kimi-quota 手动查询"
+        "zh-CN": "查询 Kimi 5 小时/月度已用额度和重置时间，支持长任务自动播报、结束刷新及 /kimi-quota 手动查询"
+      },
+      "category": "productivity"
+    },
+    {
+      "name": "deepseek-balance",
+      "source": "./deepseek-balance",
+      "version": "0.1.0",
+      "description": "查询 DeepSeek 官方账户余额，提供低余额提醒，支持长任务自动播报、结束刷新及 /deepseek-balance 手动查询",
+      "displayName": "DeepSeek 余额查询",
+      "displayName_i18n": {
+        "zh-CN": "DeepSeek 余额查询"
+      },
+      "description_i18n": {
+        "zh-CN": "查询 DeepSeek 官方账户余额，提供低余额提醒，支持长任务自动播报、结束刷新及 /deepseek-balance 手动查询"
       },
       "category": "productivity"
     }

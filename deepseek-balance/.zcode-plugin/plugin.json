@@ -1,0 +1,10 @@
+{
+  "name": "deepseek-balance",
+  "version": "0.1.0",
+  "description": "查询 DeepSeek 官方账户余额，提供低余额提醒，支持长任务自动播报、结束刷新及 /deepseek-balance 手动查询",
+  "author": {
+    "name": "SniperXu"
+  },
+  "commands": "./commands",
+  "hooks": "./hooks/hooks.json"
+}

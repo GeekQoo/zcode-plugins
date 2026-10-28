@@ -1,0 +1,64 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/deepseek_balance.sh\" sessionstart",
+            "timeoutMs": 5000,
+            "statusMessage": "检查会话模型"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/deepseek_balance.sh\" prompt",
+            "timeoutMs": 5000,
+            "statusMessage": "初始化余额播报"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/deepseek_balance.sh\" progress",
+            "timeoutMs": 4000,
+            "statusMessage": "检查余额播报间隔"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/deepseek_balance.sh\" progress",
+            "timeoutMs": 4000,
+            "statusMessage": "检查余额播报间隔"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/deepseek_balance.sh\" stop",
+            "timeoutMs": 7000,
+            "statusMessage": "刷新最终 DeepSeek 余额"
+          }
+        ]
+      }
+    ]
+  }
+}

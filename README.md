@@ -6,7 +6,8 @@
 
 | 插件 | 功能 | 版本与日期 |
 | --- | --- | --- |
-| [Kimi 额度](kimi-quota/README.md) | 长任务中途播报用量、结束时刷新，支持 `/kimi-quota` 手动查询 | v0.1.9 · 2026-10-27 |
+| [Kimi 额度查询](kimi-quota/README.md) | 5 小时/月度额度与重置时间，自动播报、结束刷新及 `/kimi-quota` 手动查询 | v0.1.10 · 2026-10-28 |
+| [DeepSeek 余额查询](deepseek-balance/README.md) | 官方账户余额与低余额提醒，自动播报、结束刷新及 `/deepseek-balance` 手动查询 | v0.1.0 · 2026-10-28 |
 
 ## 如何使用
 
@@ -24,4 +25,4 @@ kimi-quota/
 └── hooks/                      门控查询与会话注入
 ```
 
-每个插件放在同名目录中，市场名称和插件条目以根目录的 `marketplace.json` 为准。
+每个插件放在同名目录中，DeepSeek 余额查询插件采用相同目录结构。市场名称和插件条目以根目录的 `marketplace.json` 为准。
