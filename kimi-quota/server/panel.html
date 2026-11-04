@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Kimi 额度</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --border: #e4e6eb;
+    --text: #1f2329;
+    --subtle: #6b7280;
+    --green: #16a34a;
+    --green-soft: rgba(22, 163, 74, 0.12);
+    --red: #dc2626;
+    --red-soft: rgba(220, 38, 38, 0.1);
+    --track: #eceef2;
+  }
+  [data-theme="dark"] {
+    --bg: #1c1e24;
+    --card: #24262e;
+    --border: #33363f;
+    --text: #e8eaee;
+    --subtle: #9aa1ad;
+    --green: #4ade80;
+    --green-soft: rgba(74, 222, 128, 0.14);
+    --red: #f87171;
+    --red-soft: rgba(248, 113, 113, 0.12);
+    --track: #33363f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 14px;
+    overflow-y: auto;
+  }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex: none; }
+  .dot.warn { background: var(--red); }
+  .updated { font-size: 11px; color: var(--subtle); }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .card .label { font-size: 12px; color: var(--subtle); display: flex; justify-content: space-between; }
+  .pct-row { display: flex; align-items: baseline; gap: 8px; margin: 4px 0 8px; }
+  .pct { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
+  .used-detail { font-size: 12px; color: var(--subtle); }
+  .state-ok { color: var(--green); }
+  .state-over { color: var(--red); }
+  .bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+  .bar > i { display: block; height: 100%; border-radius: 3px; background: var(--green); transition: width 0.4s ease; }
+  .bar > i.over { background: var(--red); }
+  .reset { margin-top: 8px; font-size: 12px; color: var(--subtle); display: flex; justify-content: space-between; gap: 8px; }
+  .reset b { color: var(--text); font-weight: 600; }
+  .notice {
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    margin-bottom: 10px;
+    display: none;
+  }
+  .notice.error { background: var(--red-soft); color: var(--red); display: block; }
+  .notice.stale { background: var(--green-soft); color: var(--subtle); display: block; }
+  .actions { display: flex; gap: 8px; margin-top: 2px; }
+  button {
+    font: inherit; font-size: 12px;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--subtle); }
+  button[disabled] { opacity: 0.55; cursor: default; }
+  .placeholder { color: var(--subtle); text-align: center; padding: 32px 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>Kimi 额度</h1>
+    <span class="updated" id="updated"></span>
+  </header>
+
+  <div class="notice error" id="error"></div>
+  <div class="notice stale" id="stale">当前为缓存数据，网络恢复后自动刷新</div>
+
+  <div id="content">
+    <div class="placeholder" id="loading">正在获取额度…</div>
+  </div>
+
+  <div class="actions">
+    <button id="refresh" type="button">立即刷新</button>
+  </div>
+
+<script>
+"use strict";
+(function () {
+  var QUOTA_URI = "ui://kimi-quota/quota.json";
+  var bridge = window.zcode || null;
+  var els = {
+    dot: document.getElementById("dot"),
+    updated: document.getElementById("updated"),
+    error: document.getElementById("error"),
+    stale: document.getElementById("stale"),
+    content: document.getElementById("content"),
+    refresh: document.getElementById("refresh"),
+  };
+
+  function pct(ratio) {
+    if (ratio == null || !isFinite(ratio)) return "—";
+    var v = Math.round(ratio * 1000) / 10;
+    return (v >= 100 ? 100 : v) + "%";
+  }
+  function isOver(ratio) { return ratio != null && isFinite(ratio) && ratio > 0.8; }
+  function fmtTime(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return p(d.getMonth() + 1) + "/" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+  function countdown(iso) {
+    if (!iso) return "";
+    var ms = new Date(iso).getTime() - Date.now();
+    if (!isFinite(ms)) return "";
+    if (ms <= 0) return "即将重置";
+    var min = Math.floor(ms / 60000);
+    var h = Math.floor(min / 60), m = min % 60;
+    if (h > 24) return "约 " + Math.floor(h / 24) + " 天 " + (h % 24) + " 小时后";
+    if (h >= 1) return h + " 小时 " + m + " 分后";
+    return m + " 分后";
+  }
+
+  function card(title, data, resetLabel) {
+    var over = isOver(data && data.usedRatio);
+    var bar = Math.max(2, Math.min(100, Math.round((data && data.usedRatio || 0) * 100)));
+    var detail = data && data.used != null && data.limit != null
+      ? "已用 " + data.used + " / " + data.limit
+      : (data && data.usedRatio != null ? "已用比例" : "暂无数据");
+    return '<section class="card">'
+      + '<div class="label"><span>' + title + '</span><span class="reset-at"></span></div>'
+      + '<div class="pct-row"><span class="pct ' + (over ? "state-over" : "state-ok") + '">' + pct(data && data.usedRatio) + "</span>"
+      + '<span class="used-detail">' + detail + "</span></div>"
+      + '<div class="bar"><i class="' + (over ? "over" : "") + '" style="width:' + bar + '%"></i></div>'
+      + '<div class="reset"><span>' + resetLabel + ' <b class="reset-time">' + fmtTime(data && data.resetTime) + "</b></span>"
+      + '<span class="countdown">' + countdown(data && data.resetTime) + "</span></div>"
+      + "</section>";
+  }
+
+  var tickTimer = null;
+  function render(snap) {
+    if (!snap) return;
+    els.loading && (els.loading.style.display = "none");
+    var anyOver = isOver(snap.fiveHour && snap.fiveHour.usedRatio) || isOver(snap.monthly && snap.monthly.usedRatio);
+    els.dot.className = "dot" + (anyOver ? " warn" : "");
+    els.updated.textContent = snap.fetchedAt ? "更新于 " + fmtTime(snap.fetchedAt) : "";
+    if (snap.error) {
+      els.error.textContent = snap.error;
+      els.error.className = "notice error";
+    } else {
+      els.error.className = "notice";
+    }
+    els.stale.className = snap.stale && !snap.error ? "notice stale" : "notice";
+    els.content.innerHTML = card("5 小时窗口", snap.fiveHour, "重置")
+      + card("本月用量", snap.monthly, "重置");
+    if (tickTimer) clearInterval(tickTimer);
+    tickTimer = setInterval(function () {
+      var nodes = els.content.querySelectorAll(".card");
+      [snap.fiveHour, snap.monthly].forEach(function (data, i) {
+        if (!nodes[i]) return;
+        var cd = nodes[i].querySelector(".countdown");
+        if (cd) cd.textContent = countdown(data && data.resetTime);
+      });
+    }, 30000);
+  }
+
+  function load() {
+    if (!bridge || typeof bridge.readResource !== "function") {
+      els.error.textContent = "未检测到 ZCode 宿主桥接，请从 ZCode 侧栏标签页打开本面板。";
+      els.error.className = "notice error";
+      els.loading && (els.loading.style.display = "none");
+      return;
+    }
+    bridge.readResource(QUOTA_URI).then(function (result) {
+      var text = result && result.contents && result.contents[0] && result.contents[0].text;
+      try { render(JSON.parse(text)); } catch (e) { els.error.textContent = "额度数据解析失败"; els.error.className = "notice error"; }
+    }).catch(function (err) {
+      els.error.textContent = "读取额度失败：" + (err && err.message || err);
+      els.error.className = "notice error";
+      els.loading && (els.loading.style.display = "none");
+    });
+  }
+
+  els.refresh.addEventListener("click", function () {
+    els.refresh.disabled = true;
+    var done = function () { setTimeout(function () { els.refresh.disabled = false; }, 1000); };
+    if (bridge && typeof bridge.callTool === "function") {
+      bridge.callTool("get_quota", {}).then(load).catch(load).then(done, done);
+    } else { load(); done(); }
+  });
+
+  if (bridge) {
+    if (typeof bridge.subscribeResource === "function") {
+      try { bridge.subscribeResource(QUOTA_URI); } catch (e) { /* 宿主不支持时退回轮询 */ }
+    }
+    if (typeof bridge.onResourceUpdated === "function") {
+      try { bridge.onResourceUpdated(load); } catch (e) { /* 同上 */ }
+    }
+    if (typeof bridge.subscribe === "function") {
+      try {
+        bridge.subscribe(function () { applyTheme(); });
+      } catch (e) { /* 主题跟随不可用时保持默认 */ }
+    }
+    setInterval(load, 5 * 60 * 1000);
+  }
+
+  function applyTheme() {
+    var theme = bridge && bridge.theme;
+    if (theme !== "light" && theme !== "dark") {
+      theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = theme;
+  }
+  applyTheme();
+
+  // 演示模式：URL 显式带 demo 参数时预览样式，宿主内始终走真实数据
+  if (/[?&]demo\b/.test(location.search)) {
+    render({ ok: true, fetchedAt: new Date().toISOString(), stale: false, error: null,
+      fiveHour: { usedRatio: 0.42, used: 126, limit: 300, resetTime: new Date(Date.now() + 2.2 * 3600e3).toISOString() },
+      monthly: { usedRatio: 0.86, used: null, limit: null, resetTime: new Date(Date.now() + 21 * 86400e3).toISOString() } });
+  } else {
+    load();
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,10 +1,35 @@
 {
   "name": "kimi-quota",
-  "version": "0.1.10",
-  "description": "查询 Kimi 5 小时/月度已用额度和重置时间，支持长任务自动播报、结束刷新及 /kimi-quota 手动查询",
+  "version": "0.2.0",
+  "description": "查询 Kimi 5 小时/月度已用额度和重置时间：聊天自动播报 + 常驻侧栏面板 + /kimi-quota 手动查询",
   "author": {
     "name": "SniperXu"
   },
   "commands": "./commands",
-  "hooks": "./hooks/hooks.json"
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "kimi-quota": {
+      "type": "stdio",
+      "command": "/Applications/ZCode.app/Contents/Frameworks/ZCode Helper.app/Contents/MacOS/ZCode Helper",
+      "args": ["${ZCODE_PLUGIN_ROOT}/server/server.mjs"],
+      "cwd": "${ZCODE_PROJECT_DIR}",
+      "env": {
+        "ELECTRON_RUN_AS_NODE": "1",
+        "ZCODE_WORKSPACE_ROOT": "${ZCODE_PROJECT_DIR}",
+        "ZCODE_PLUGIN_DATA": "${ZCODE_PLUGIN_DATA}"
+      }
+    }
+  },
+  "ui": {
+    "surfaces": [
+      {
+        "id": "kimi-quota",
+        "title": { "zh-CN": "Kimi 额度", "en-US": "Kimi Quota" },
+        "icon": "gauge",
+        "server": "kimi-quota",
+        "resourceUri": "ui://kimi-quota/panel.html",
+        "availability": "session"
+      }
+    ]
+  }
 }

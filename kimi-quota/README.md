@@ -2,7 +2,9 @@
 
 使用 Kimi 模型时，长任务中途默认每 10 分钟检查并播报一次用量；任务结束时再主动刷新，显示 5 小时、月度已用比例和各自的重置时间。也可以用 `/kimi-quota` 手动查询。
 
-使用其他模型时，不显示状态行，也不发起额度查询请求。
+0.2.0 起提供**常驻侧栏面板**：在 ZCode Desktop 右侧面板区的「打开标签页」中选择「Kimi 额度」即可打开。面板不占聊天记录，常驻显示 5 小时与月度已用比例、重置倒计时，超过 80% 变红；数据自动刷新（成功数据 60 秒节流，面板打开期间每 20 秒检查一次），断网时显示缓存并标注。
+
+使用其他模型时，不显示状态行，也不发起额度查询请求。聊天播报与面板互不影响：面板独立于会话模型工作，任何会话都能查看。
 
 ## 状态行示例
 
@@ -38,3 +40,12 @@
 ## 本地回归
 
 运行 `python3 -m unittest discover -s kimi-quota/tests -v`（在仓库根目录执行）。测试使用临时目录、模拟时钟、接口和密钥，覆盖长任务与并发事件，不读取真实密钥或请求网络。
+
+面板 server 的 stdio 冒烟测试：`bash kimi-quota/tests/smoke_server.sh`。它会以真实配置发起一次额度查询（需要已配置 Kimi 密钥），并校验 initialize、tools、resources、subscribe 的协议行为。
+
+## 0.2.0 面板架构
+
+- `server/server.mjs`：零依赖 stdio MCP server（Node ≥ 18，随 ZCode 内置 Helper 运行）。提供 `get_quota` 工具、`ui://kimi-quota/panel.html` 面板资源与 `ui://kimi-quota/quota.json` 数据资源，支持 `resources/subscribe` 订阅推送；快照持久化在插件数据目录，重启后先显示缓存。
+- `server/panel.html`：面板页面，通过宿主注入的 `window.zcode` 别名桥读取/订阅数据，无构建步骤；URL 带 `demo` 参数时显示演示数据便于预览样式。
+- 额度拉取逻辑与 `hooks/kimi_quota.sh` 保持一致：同一密钥来源（`KIMI_API_KEY` 或 ZCode 供应商配置）、同一官方域名白名单、同一解析规则与 80% 红线。
+- 清单通过 `ui.surfaces`（`availability: "session"`）声明会话面板，入口在右侧面板区「打开标签页」；MCP server 命令指向本机 ZCode.app 内置 Helper，不依赖系统安装 Node。
