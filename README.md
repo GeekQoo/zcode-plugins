@@ -6,7 +6,7 @@
 
 | 插件 | 功能 | 版本与日期 |
 | --- | --- | --- |
-| [Kimi 额度查询](kimi-quota/README.md) | 5 小时/月度额度与重置时间，自动播报、结束刷新及 `/kimi-quota` 手动查询 | v0.1.10 · 2026-10-28 |
+| [Kimi 额度查询](kimi-quota/README.md) | 5 小时/月度额度与重置时间，自动播报、结束刷新及 `/kimi-quota` 手动查询 | v0.2.1 · 2026-11-04 |
 | [DeepSeek 余额查询](deepseek-balance/README.md) | 官方账户余额与低余额提醒，自动播报、结束刷新及 `/deepseek-balance` 手动查询 | v0.1.0 · 2026-10-28 |
 
 ## 如何使用
